@@ -1,4 +1,4 @@
-"""Protocol and filter engine shared with Colab WebSocket 2.4."""
+"""Protocol and filter engine shared with Colab WebSocket 2.5."""
 import json, re, logging, struct
 
 import anyio
@@ -628,7 +628,7 @@ def published_time(value):
 
 from collections import OrderedDict, Counter
 
-BOT_VERSION = '2.4-websocket'
+BOT_VERSION = '2.5-websocket'
 
 WS_URL = 'wss://wss-flash-2.jin10.com/'
 
@@ -745,7 +745,7 @@ def format_ws_news(row):
 
 def ws_connect():
     from websockets.asyncio.client import connect
-    return connect(WS_URL, origin='https://www.jin10.com', user_agent_header='Jin10PersonalNewsBot/2.4', ping_interval=None, open_timeout=10, close_timeout=2, max_size=2 * 1024 * 1024)
+    return connect(WS_URL, origin='https://www.jin10.com', user_agent_header='Jin10PersonalNewsBot/2.5', ping_interval=None, open_timeout=10, close_timeout=2, max_size=2 * 1024 * 1024)
 
 class WSNewsBot(NewsBot):
 
@@ -794,15 +794,11 @@ class WSNewsBot(NewsBot):
             self.stats['diagnostic_duplicates'] += 1
             return
         self.seen_versions.add(key)
-        self.backlog[row['id']] = row
-        if len(self.backlog) > 200:
-            raise BotError('LINE 待送佇列超過 200 則，已停止，請檢查傳送速度。')
-        self.changed_event.set()
+        self.log('無法辨識資料已略過，不會排入 LINE。')
 
     def eligible(self, row):
         if row.get('kind') == 'unparsed':
-            age = self.now() - news_datetime(row['time'])
-            return timedelta(seconds=-60) <= age <= self.max_age
+            return False
         return super().eligible(row)
 
     def accept_news(self, item, *, baseline=False, recovered=False, packet_code=None):
@@ -977,7 +973,8 @@ class WSNewsBot(NewsBot):
                 try:
                     row = ws_news_row(item, received=self.now())
                 except NewsRecordError as exc:
-                    row = self.reject_news(item, exc, packet_code=1200)
+                    self.reject_news(item, exc, packet_code=1200)
+                    continue
                 if row is not None:
                     rows.append(row)
             rows.sort(key=lambda r: news_datetime(r['time']), reverse=True)

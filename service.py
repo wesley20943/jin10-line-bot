@@ -16,7 +16,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import engine as e
 
-CLOUD_BUILD = 'line-check-20260930'
+CLOUD_BUILD = 'skip-unparsed-20260930'
 
 
 class BoundedSeen:
@@ -108,6 +108,11 @@ class CloudBot(e.WSNewsBot):
         self.initialized = self.read_setting('initialized', False) is True
         self.reconnect_event = asyncio.Event()
         self.receive_task = self.send_task = None
+        # 2.5 no longer sends unparseable source records. Drop only records
+        # that have never been attempted; pending requests keep their retry key
+        # because LINE may already have accepted them.
+        with self.db:
+            self.db.execute("UPDATE outbox SET status='skipped' WHERE scope=? AND status='queued' AND json_extract(row_json,'$.kind')='unparsed'", (self.scope,))
         self.prune()
 
     def read_setting(self, name, default=None):
@@ -169,11 +174,7 @@ class CloudBot(e.WSNewsBot):
 
     def stage_unparsed(self, row):
         super().stage_unparsed(row)
-        queued = self.backlog.pop(row['id'], None)
-        if queued:
-            self.queue_candidate(queued)
-        # Persist observations made while paused too, so restart snapshots do
-        # not replay diagnostics received during that pause.
+        # Persist the observation so reconnect snapshots do not log it again.
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO seen VALUES(?,?,?)',
                             (self.scope, e.event_key(row), self.now().timestamp()))

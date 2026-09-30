@@ -235,16 +235,16 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sent),2)
         self.assertEqual(bot.stats['reconnects'],1)
 
-    async def test_bad_records_do_not_stop_cloud_receiver_or_poison_cache(self):
+    async def test_bad_records_are_skipped_without_stopping_receiver(self):
         socket=Socket([{'id':'bad'}],[packet(1000,{'action':1,'time':None}),
                       packet(1000,item(2,now=self.now,time=None)),packet(1201),
                       packet(1000,item(3,now=self.now))])
         bot=self.bot(connector=connector(socket),sleep=quick_sleep);bot.set_enabled(True);bot.start()
         for _ in range(100):
             await asyncio.sleep(.002)
-            if len(self.sent)==4:break
-        self.assertEqual(len(self.sent),4)
-        self.assertEqual(sum('【無法辨識資料】' in p[1] for p in self.sent),3)
+            if len(self.sent)==1:break
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(sum('【無法辨識資料】' in p[1] for p in self.sent),0)
         self.assertTrue(any(item(3)['id'] in p[1] and p[1].startswith(item(3)['data']['content']) for p in self.sent))
         self.assertEqual(bot.stats['invalid_records'],3)
         self.assertIn(b'',socket.sent)
@@ -263,34 +263,19 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot.accept_news({'id':item(number)['id'],'action':2,'time':None}))
         self.assertEqual(dict(bot.pending()[0]),pending)
         self.assertNotEqual(bot.cache[item(1)['id']]['time'],None)
-        self.assertEqual(bot.counts().get('queued',0),2)
-        queued=bot.db.execute("SELECT row_json FROM outbox WHERE status='queued'").fetchall()
-        self.assertTrue(all(json.loads(r['row_json']).get('kind')=='unparsed' for r in queued))
+        self.assertEqual(bot.counts().get('queued',0),0)
 
-    async def test_diagnostic_survives_filters_timeout_restart_and_duplicate_snapshot(self):
-        async def fail(state,text,key):
-            await self.push(state,text,key)
-            raise httpx2.ReadTimeout('fixture')
-        bot=self.bot(push=fail);bot.set_enabled(True);bot.handle_snapshot([])
+    async def test_diagnostic_is_skipped_across_filters_restart_and_snapshot(self):
+        bot=self.bot();bot.set_enabled(True);bot.handle_snapshot([])
         bad={'id':'broken','data':{'content':'主題：持倉報告'}}
         bot.accept_news(bad,packet_code=1000)
-        before=dict(bot.db.execute("SELECT * FROM outbox WHERE status='queued'").fetchone())
         bot.save_rules({'version':1,'include':[],'exclude':['主題','持倉報告'],'conflict':'exclude'})
-        self.assertEqual(dict(bot.get(before['event_key'])),before)
-        self.assertEqual(await bot.send_one(),'retry')
-        async def accepted_before(state,text,key):
-            await self.push(state,text,key)
-            return types.SimpleNamespace(status_code=409,headers={'x-line-accepted-request-id':'fixture'})
-        self.now+=timedelta(seconds=6)
-        bot=await self.reopen(bot,push=accepted_before)
-        bot.handle_snapshot([bad])
-        self.assertEqual(await bot.send_one(),'accepted')
-        self.assertEqual(self.sent[0],self.sent[1])
-        self.assertIn('【無法辨識資料】',self.sent[0][1])
+        self.assertEqual(bot.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
         bot=await self.reopen(bot)
+        bot.handle_snapshot([bad])
         bot.accept_news(dict(reversed(list(bad.items()))),packet_code=1001)
         self.assertEqual(await bot.send_one(),'idle')
-        self.assertEqual(bot.counts()['accepted'],1)
+        self.assertFalse(self.sent)
 
     async def test_diagnostic_respects_pause_and_no_replay_after_restart(self):
         bot=self.bot()
@@ -303,22 +288,46 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         bot.handle_snapshot([bad])
         self.assertEqual(await bot.send_one(),'idle')
         bot.accept_news({'id':'new-bad'})
-        self.assertEqual(bot.counts()['queued'],1)
+        self.assertEqual(bot.counts().get('queued',0),0)
         bot.set_enabled(False)
         bot.set_enabled(True)
         self.assertEqual(await bot.send_one(),'idle')
         self.assertFalse(self.sent)
 
-    async def test_diagnostic_redaction_in_durable_storage(self):
+    async def test_diagnostic_payload_is_not_stored_or_logged(self):
         bot=self.bot();bot.set_enabled(True)
         bad={'id':'bad','access_token':'private-source-token',
              'data':{'content':STATE['token']+' '+STATE['user_id']}}
         bot.accept_news(bad)
-        record=bot.db.execute('SELECT text,row_json FROM outbox').fetchone()
-        for value in record:
-            self.assertIn('[已遮蔽]',value)
-            for secret in ('private-source-token',STATE['token'],STATE['user_id']):
-                self.assertNotIn(secret,value)
+        self.assertEqual(bot.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        logs=json.dumps(list(bot.logs),ensure_ascii=False)
+        self.assertIn('無法辨識資料已略過',logs)
+        for secret in ('private-source-token',STATE['token'],STATE['user_id']):
+            self.assertNotIn(secret,logs)
+
+    async def test_upgrade_skips_old_unattempted_diagnostic_queue(self):
+        bot=self.bot();bot.set_enabled(True)
+        stamp=self.now.timestamp()
+        with bot.db:
+            bot.db.execute('INSERT INTO outbox (scope,event_key,text,news_time,retry_key,news_id,row_json) VALUES (?,?,?,?,?,?,?)',
+                           (bot.scope,'old-unparsed','old raw payload',stamp,'fixture-retry','unparsed:old',json.dumps({'kind':'unparsed'})))
+        bot=await self.reopen(bot)
+        record=bot.get('old-unparsed')
+        self.assertEqual(record['status'],'skipped')
+        self.assertIsNone(record['first_attempt'])
+        self.assertEqual(await bot.send_one(),'idle')
+        self.assertFalse(self.sent)
+
+    async def test_upgrade_preserves_attempted_diagnostic_retry_identity(self):
+        bot=self.bot();bot.set_enabled(True)
+        stamp=self.now.timestamp()
+        with bot.db:
+            bot.db.execute("INSERT INTO outbox (scope,event_key,text,news_time,status,retry_key,news_id,row_json,first_attempt,last_attempt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (bot.scope,'old-pending','old pending payload',stamp,'pending','same-retry','unparsed:pending',json.dumps({'kind':'unparsed'}),stamp,stamp))
+        bot=await self.reopen(bot)
+        record=bot.get('old-pending')
+        self.assertEqual(record['status'],'pending')
+        self.assertEqual(record['retry_key'],'same-retry')
 
     async def test_candidate_status_explains_pause_without_backfill(self):
         bot=self.bot();bot.handle_snapshot([])
@@ -414,7 +423,7 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await client.post('/api/control',json=command)).status_code,401)
                 await client.post('/api/login',json={'password':PASSWORD})
                 status=(await client.get('/api/status')).json()
-                self.assertEqual(status['version'],'2.4-websocket')
+                self.assertEqual(status['version'],'2.5-websocket')
                 self.assertEqual(status['build'],CLOUD_BUILD)
                 self.assertIsNone(status['delivery']['test'])
                 self.assertEqual((await client.get('/api/control')).status_code,405)

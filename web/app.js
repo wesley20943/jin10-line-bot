@@ -51,7 +51,7 @@ async function refresh() {
     $('recipient').textContent=data.bot_name+' → '+data.recipient;
     $('today').replaceChildren(document.createTextNode(String(data.counts.today||0)+' '),node('em','則'));
     $('notify').textContent=data.enabled?'暫停 LINE':'啟用 LINE';
-    $('notify-hint').textContent=data.enabled?'符合條件的新快訊及「無法辨識資料」會傳到 LINE。':'啟用後傳送新快訊與無法辨識資料；暫停期間不補發。';
+    $('notify-hint').textContent=data.enabled?'符合條件的新快訊會傳到 LINE；無法辨識資料會直接略過。':'啟用後只傳送符合條件的新快訊；暫停期間不補發。';
     $('queue-status').textContent=`待傳 ${data.counts.queued||0} 則 · 傳送中／結果待確認 ${data.counts.pending||0} 則`;
     $('latest-delivery').textContent='最近傳送：'+deliveryText(data.delivery.latest);
     $('test-result').textContent='測試結果：'+(data.delivery.test?deliveryText(data.delivery.test):'尚未測試');
