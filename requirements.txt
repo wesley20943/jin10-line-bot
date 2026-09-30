@@ -1,0 +1,7 @@
+websockets==16.0
+httpx2==2.13.1
+anyio==4.15.1
+opencc-python-reimplemented==0.1.7
+starlette==1.7.0
+uvicorn==0.54.0
+itsdangerous==2.2.0
