@@ -1,4 +1,4 @@
-"""Protocol and filter engine shared with Colab WebSocket 2.3."""
+"""Protocol and filter engine shared with Colab WebSocket 2.4."""
 import json, re, logging, struct
 
 import anyio
@@ -345,6 +345,8 @@ def news_datetime(value):
         raise BotError('快訊時間格式不完整，已停止；請回報欄位格式。') from None
 
 def event_key(row):
+    if row.get('kind') == 'unparsed':
+        return row['id']
     identity = [row.get('url') or row['time'], normalize(row['text'])]
     return sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
@@ -357,17 +359,17 @@ def clip_utf16(text, limit):
     suffix = '\n（原文較長，完整內容請開啟來源）'
     return text.encode('utf-16-le')[:(limit - utf16_length(suffix)) * 2].decode('utf-16-le', errors='ignore') + suffix
 
-def format_news(row):
+def format_news(row, *, metadata=()):
     clock = news_datetime(row['time']).astimezone(TAIPEI).strftime('%m/%d %H:%M:%S')
-    title = '、'.join(row['topics'][:3]) or '關注快訊'
-    header = f'【我的關注快訊】\n{clock}（台北）\n主題：{title}\n'
+    details = [f'時間：{clock}', *metadata]
     status = row.get('status_hint', '')
     if status and status != '來源與狀態待核對':
-        header += f'提醒：{status}\n'
+        details.append(f'提醒：{status}')
     url = row.get('url', '')
     footer = '\n來源：金十\n' + url if url and utf16_length(url) < 1000 else '\n來源：金十'
-    body = clip_utf16(row['text'], min(2800, 4700 - utf16_length(header + footer)))
-    return header + '\n' + body + footer
+    notes = '\n'.join(details) + footer
+    body = clip_utf16(row['text'], min(2800, 4700 - utf16_length(notes)))
+    return body + '\n\n' + notes
 
 class NewsBot:
 
@@ -626,7 +628,7 @@ def published_time(value):
 
 from collections import OrderedDict, Counter
 
-BOT_VERSION = '2.3-websocket'
+BOT_VERSION = '2.4-websocket'
 
 WS_URL = 'wss://wss-flash-2.jin10.com/'
 
@@ -698,8 +700,36 @@ def ws_news_row(item, *, received=None, changed=False, recovered=False):
     row.update(classify_with_user_filters(text))
     return row
 
+def clip_diagnostic(text, limit):
+    text = text.encode('utf-8', errors='replace').decode('utf-8')
+    if utf16_length(text) <= limit:
+        return text
+    suffix = '\n…（資料過長，以上為節錄）'
+    return text.encode('utf-16-le')[:(limit - utf16_length(suffix)) * 2].decode('utf-16-le', errors='ignore') + suffix
+
+def redact_diagnostic_fields(value):
+    if isinstance(value, dict):
+        result = {}
+        for key, part in value.items():
+            compact = re.sub('[^a-z0-9]', '', str(key).lower())
+            sensitive = any((word in compact for word in ('token', 'secret', 'password', 'authorization', 'apikey', 'accesskey', 'credential', 'cookie')))
+            result[key] = '[已遮蔽]' if sensitive else redact_diagnostic_fields(part)
+        return result
+    if isinstance(value, list):
+        return [redact_diagnostic_fields(part) for part in value]
+    return value
+
+def unparsed_news_row(item, error, *, received, packet_code=None, redactor=str):
+    canonical = json.dumps(item, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+    identity = 'unparsed:' + sha256(canonical.encode('ascii')).hexdigest()
+    raw = json.dumps(redact_diagnostic_fields(item), ensure_ascii=False, indent=2)
+    return {'kind': 'unparsed', 'id': identity, 'url': '', 'time': received.isoformat(), 'received': received, 'text': clip_diagnostic(redactor(raw), 4000), 'reason': clip_diagnostic(redactor(str(error)), 400), 'packet_code': packet_code, 'decision': '無法辨識', 'topics': []}
+
 def format_ws_news(row):
-    original = format_news(row)
+    if row.get('kind') == 'unparsed':
+        clock = news_datetime(row['time']).astimezone(TAIPEI).strftime('%m/%d %H:%M:%S')
+        code = row.get('packet_code')
+        return row['text'] + f"\n\n【無法辨識資料】\n收到時間：{clock}\n原因：{row['reason']}\n" + (f'封包代碼：{code}\n' if code is not None else '') + '上方為原始資料，未套用新聞關鍵字篩選；敏感欄位已遮蔽。'
     additions = []
     if row.get('important') is True:
         additions.append('🔴 金十標記：重要')
@@ -711,11 +741,11 @@ def format_ws_news(row):
         additions.append('消息更新：來源修改了此則內容')
     if row.get('recovered'):
         additions.append('重連後補回')
-    return original.replace('【我的關注快訊】', '【我的關注快訊】' + ('\n' + '\n'.join(additions) if additions else ''), 1)
+    return format_news(row, metadata=additions)
 
 def ws_connect():
     from websockets.asyncio.client import connect
-    return connect(WS_URL, origin='https://www.jin10.com', user_agent_header='Jin10PersonalNewsBot/2.3', ping_interval=None, open_timeout=10, close_timeout=2, max_size=2 * 1024 * 1024)
+    return connect(WS_URL, origin='https://www.jin10.com', user_agent_header='Jin10PersonalNewsBot/2.4', ping_interval=None, open_timeout=10, close_timeout=2, max_size=2 * 1024 * 1024)
 
 class WSNewsBot(NewsBot):
 
@@ -747,14 +777,41 @@ class WSNewsBot(NewsBot):
         self.invalid_samples = self.invalid_samples[-5:]
         count = self.stats['invalid_records']
         if count <= 3 or count % 50 == 0:
-            self.log('略過一筆無法辨識的資料，繼續接收；累計 ' + str(count) + ' 筆。診斷：' + json.dumps(sample, ensure_ascii=False))
+            self.log('收到一筆無法辨識的資料，繼續接收；累計 ' + str(count) + ' 筆。診斷：' + json.dumps(sample, ensure_ascii=False))
+
+        def redact_raw(text):
+            for name in ('token', 'user_id'):
+                value = self.state.get(name)
+                if value:
+                    text = text.replace(value, '[已遮蔽]')
+            return self.redactor(text)
+        return unparsed_news_row(item, error, received=self.now(), packet_code=packet_code, redactor=redact_raw)
+
+    def stage_unparsed(self, row):
+        key = event_key(row)
+        previous = self.get(key)
+        if key in self.seen_versions or (previous and previous['status'] != 'queued'):
+            self.stats['diagnostic_duplicates'] += 1
+            return
+        self.seen_versions.add(key)
+        self.backlog[row['id']] = row
+        if len(self.backlog) > 200:
+            raise BotError('LINE 待送佇列超過 200 則，已停止，請檢查傳送速度。')
+        self.changed_event.set()
+
+    def eligible(self, row):
+        if row.get('kind') == 'unparsed':
+            age = self.now() - news_datetime(row['time'])
+            return timedelta(seconds=-60) <= age <= self.max_age
+        return super().eligible(row)
 
     def accept_news(self, item, *, baseline=False, recovered=False, packet_code=None):
         try:
             self.handle_news(item, baseline=baseline, recovered=recovered)
             return True
         except NewsRecordError as exc:
-            self.reject_news(item, exc, packet_code=packet_code)
+            row = self.reject_news(item, exc, packet_code=packet_code)
+            self.stage_unparsed(row)
             return False
 
     def queue(self, row):
@@ -915,19 +972,18 @@ class WSNewsBot(NewsBot):
                 raise BotError('未收到 WebSocket 快照，請回報畫面上的狀態。')
             rows = []
             for item in items:
-                if isinstance(item, dict) and item.get('action', 1) == 3:
+                if isinstance(item, dict) and item.get('action', 1) not in (1, 2):
                     continue
                 try:
                     row = ws_news_row(item, received=self.now())
                 except NewsRecordError as exc:
-                    self.reject_news(item, exc, packet_code=1200)
-                    continue
+                    row = self.reject_news(item, exc, packet_code=1200)
                 if row is not None:
                     rows.append(row)
             rows.sort(key=lambda r: news_datetime(r['time']), reverse=True)
             counts = Counter((r['decision'] for r in rows))
             self.log('WebSocket 預覽：' + '、'.join((f'{k} {v}' for k, v in counts.items())))
-            self.show_feed_time(rows)
+            self.show_feed_time([row for row in rows if row.get('kind') != 'unparsed'])
             plan = self.make_plan(rows)
             self.show_plan(plan)
             return (items, {'rows': rows, 'counts': dict(counts)}, plan)
@@ -971,7 +1027,7 @@ class WSNewsBot(NewsBot):
                 try:
                     await asyncio.wait_for(self.changed_event.wait(), min(30, max(0.01, deadline - self.monotonic())))
                 except TimeoutError:
-                    self.log(f"持續接收中｜本次新增／更新 {self.stats['received']} 則｜候選 {self.stats['候選']} 則｜LINE 接受 {self.stats['accepted']} 則｜格式略過 {self.stats['invalid_records']} 筆")
+                    self.log(f"持續接收中｜本次新增／更新 {self.stats['received']} 則｜候選 {self.stats['候選']} 則｜LINE 接受 {self.stats['accepted']} 則｜無法辨識 {self.stats['invalid_records']} 筆")
                 continue
             news_id, row = self.backlog.popitem(last=False)
             if not self.eligible(row):

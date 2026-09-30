@@ -9,11 +9,14 @@ import re
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import httpx2
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import engine as e
+
+CLOUD_BUILD = 'line-check-20260930'
 
 
 class BoundedSeen:
@@ -144,14 +147,36 @@ class CloudBot(e.WSNewsBot):
                 (row['id'], json.dumps(saved, ensure_ascii=False), self.scope, key))
         return key
 
+    def queue_candidate(self, row):
+        if not self.enabled:
+            self.log(f"LINE 未排入：收到時通知暫停｜ID {row['id']}")
+            return
+        key = self.queue(row)
+        if self.get(key)['status'] == 'queued':
+            note = '；目前有傳送錯誤，請查看管理頁' if self.line_error else ''
+            self.log(f"LINE 已排入待傳｜ID {row['id']}{note}")
+        self.changed_event.set()
+
     def reject_news(self, item, error, *, packet_code=None):
-        super().reject_news(item, error, packet_code=packet_code)
+        row = super().reject_news(item, error, packet_code=packet_code)
         news_id = str(item.get('id') or '') if isinstance(item, dict) else ''
         if news_id.isdigit():
             # An unusable edit cannot leave an older, unsent version queued.
             # In-flight/pending bodies remain immutable for retry safety.
             with self.db:
                 self.db.execute("UPDATE outbox SET status='cancelled' WHERE scope=? AND news_id=? AND status='queued'", (self.scope, news_id))
+        return row
+
+    def stage_unparsed(self, row):
+        super().stage_unparsed(row)
+        queued = self.backlog.pop(row['id'], None)
+        if queued:
+            self.queue_candidate(queued)
+        # Persist observations made while paused too, so restart snapshots do
+        # not replay diagnostics received during that pause.
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO seen VALUES(?,?,?)',
+                            (self.scope, e.event_key(row), self.now().timestamp()))
 
     def handle_news(self, item, *, baseline=False, recovered=False):
         self.last_event = self.now().isoformat()
@@ -176,9 +201,8 @@ class CloudBot(e.WSNewsBot):
             if row is None or not self.eligible(row):
                 self.db.execute("UPDATE outbox SET status='cancelled' WHERE scope=? AND news_id=? AND status='queued'", (self.scope, news_id))
         queued = self.backlog.pop(news_id, None)
-        if queued and self.enabled:
-            self.queue(queued)
-            self.changed_event.set()
+        if queued:
+            self.queue_candidate(queued)
         # Metadata edits may keep the same event key; refresh only unsent bodies.
         if row and self.eligible(row):
             saved = {k: v for k, v in row.items() if k != 'received'}
@@ -191,7 +215,16 @@ class CloudBot(e.WSNewsBot):
             with self.db:
                 self.db.execute('INSERT OR IGNORE INTO seen VALUES(?,?,?)', (self.scope, e.event_key(row), self.now().timestamp()))
         if row and not baseline:
-            self.recent.append({k: row[k] for k in ('id','text','time','url','decision','reason','important')})
+            if row['decision'] != '候選':
+                delivery_note = '未排入：未通過篩選'
+            elif not self.eligible(row):
+                delivery_note = '未排入：不在允許的快訊時間範圍內（最久 15 分鐘）'
+            elif not self.enabled:
+                delivery_note = '未排入：收到時 LINE 通知暫停；啟用後不補發'
+            else:
+                delivery_note = '沒有新傳送紀錄：可能已在之前處理'
+            self.recent.append({**{k: row[k] for k in ('id','text','time','url','decision','reason','important')},
+                                'event_key': e.event_key(row), 'delivery_note': delivery_note})
         if self.stats['received'] and self.stats['received'] % 1000 == 0:
             self.prune()
 
@@ -209,6 +242,8 @@ class CloudBot(e.WSNewsBot):
                 if not record['row_json']:
                     continue
                 row = json.loads(record['row_json'])
+                if row.get('kind') in ('unparsed', 'line_test'):
+                    continue
                 row.update(e.classify_with_user_filters(row['text'], rules))
                 self.db.execute('UPDATE outbox SET status=?,text=?,row_json=? WHERE scope=? AND event_key=?',
                     ('queued' if self.eligible(row) else 'cancelled', redact(e.format_ws_news(row)),
@@ -244,6 +279,65 @@ class CloudBot(e.WSNewsBot):
         midnight = self.now().astimezone(e.TAIPEI).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
         counts['today'] = self.db.execute("SELECT COUNT(*) FROM outbox WHERE scope=? AND status='accepted' AND accepted_at>=?", (self.scope, midnight)).fetchone()[0]
         return counts
+
+    def describe_delivery(self, record):
+        if record is None:
+            return None
+        status, http = record['status'], record['last_status']
+        label = {'queued': '排隊中，尚未呼叫 LINE', 'pending': '傳送中或等待確認',
+                 'accepted': 'LINE API 已接受，請核對手機',
+                 'cancelled': '已取消：內容或篩選條件變更',
+                 'skipped': '已略過：暫停通知或等待超過 15 分鐘'}.get(status, status)
+        if status in ('queued', 'pending'):
+            if self.line_error:
+                label = '傳送停止：' + self.line_error
+            elif not self.enabled:
+                label = '通知暫停，等待恢復'
+            elif status == 'pending' and http != 200:
+                label = '傳送結果尚未確認，沿用原訊息重試'
+        return {'status': status, 'label': label, 'http_status': http,
+                'time': datetime.fromtimestamp(record['last_attempt'] or record['news_time'], timezone.utc).isoformat()}
+
+    def recent_with_delivery(self):
+        return [{**row, 'delivery': self.describe_delivery(self.get(row['event_key']))}
+                for row in reversed(self.recent)]
+
+    def latest_test(self):
+        return self.db.execute("SELECT * FROM outbox WHERE scope=? AND news_id LIKE 'line-test:%' ORDER BY news_time DESC LIMIT 1", (self.scope,)).fetchone()
+
+    def delivery_status(self):
+        latest = self.db.execute('SELECT * FROM outbox WHERE scope=? AND last_attempt IS NOT NULL ORDER BY last_attempt DESC,news_time DESC LIMIT 1', (self.scope,)).fetchone()
+        test = self.latest_test()
+        return {'latest': self.describe_delivery(latest), 'test': self.describe_delivery(test)}
+
+    def queue_line_test(self):
+        """Only an explicit authenticated POST may enqueue a test; the sender owns delivery."""
+        if not self.enabled:
+            raise e.BotError('請先在本管理頁按「啟用 LINE」，再傳送測試訊息。')
+        if self.line_error:
+            raise e.BotError(self.line_error)
+        if self.stop_requested:
+            raise e.BotError('服務正在重新啟動，請稍後再試。')
+        stamp = self.now().timestamp()
+        previous = self.latest_test()
+        if previous and previous['status'] in ('queued', 'pending'):
+            if previous['status'] == 'pending' or stamp-previous['news_time'] <= 900:
+                return {'reused': True, 'delivery': self.describe_delivery(previous)}
+            with self.db:
+                self.db.execute("UPDATE outbox SET status='skipped' WHERE scope=? AND event_key=?", (self.scope, previous['event_key']))
+        if previous and stamp-previous['news_time'] < 60:
+            raise e.BotError('剛剛已建立測試訊息，請等 60 秒後再測試。')
+        key = 'line-test:' + str(uuid4())
+        clock = self.now().astimezone(e.TAIPEI).strftime('%m/%d %H:%M:%S')
+        text = ('這是你從管理頁發出的 LINE 測試訊息。\n\n'
+                '收到這則，表示 Railway 可以傳送到這個 LINE 帳號。\n'
+                f'時間：{clock}\n版本：{e.BOT_VERSION}\n測試編號：{key[-8:]}')
+        with self.db:
+            self.db.execute('INSERT INTO outbox (scope,event_key,text,news_time,retry_key,news_id,row_json) VALUES (?,?,?,?,?,?,?)',
+                            (self.scope,key,text,stamp,str(uuid4()),key,json.dumps({'kind':'line_test'})))
+        self.changed_event.set()
+        self.log('LINE 測試訊息已排入；請查看管理頁的測試結果與手機 LINE。')
+        return {'reused': False, 'delivery': self.describe_delivery(self.get(key))}
 
     async def receive_forever(self):
         delay = 5
@@ -287,7 +381,7 @@ class CloudBot(e.WSNewsBot):
                 delay = min(delay*2, 60)
 
     async def send_one(self):
-        """One durable delivery; returns idle/accepted/retry/blocked."""
+        """One durable delivery; returns idle/accepted/skipped/retry/blocked."""
         if not self.enabled or self.line_error:
             return 'idle'
         record = self.db.execute("SELECT * FROM outbox WHERE scope=? AND status IN ('pending','queued') ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,news_time LIMIT 1", (self.scope,)).fetchone()
@@ -297,14 +391,16 @@ class CloudBot(e.WSNewsBot):
         if record['status'] == 'queued' and stamp-record['news_time'] > 900:
             with self.db:
                 self.db.execute("UPDATE outbox SET status='skipped' WHERE scope=? AND event_key=?", (self.scope, record['event_key']))
-            return 'accepted'
+            self.log('LINE 已略過一則等待超過 15 分鐘的訊息。')
+            return 'skipped'
         if record['last_attempt'] is not None and stamp-record['last_attempt'] < 5:
             return 'retry'
         try:
             self.currently_sending = record['news_id']
-            await self._deliver({'scope': self.scope, 'keys': [record['event_key']]})
-            self.stats['accepted'] += 1
-            return 'accepted'
+            self.log(f"LINE 嘗試傳送｜ID {record['news_id']}")
+            accepted = await self._deliver({'scope': self.scope, 'keys': [record['event_key']]})
+            self.stats['accepted'] += accepted
+            return 'accepted' if accepted else 'idle'
         except (httpx2.TransportError, TimeoutError, OSError):
             self.log('LINE 暫時無法確認，稍後沿用原訊息重試。')
             return 'retry'
@@ -312,8 +408,11 @@ class CloudBot(e.WSNewsBot):
             current = self.get(record['event_key'])
             expired = current['first_attempt'] is not None and stamp-current['first_attempt'] >= 23*3600
             if current['last_status'] is not None and current['last_status'] >= 500 and not expired:
+                self.log(f"LINE HTTP {current['last_status']}，稍後沿用原訊息重試。")
                 return 'retry'
-            message = f"LINE HTTP {current['last_status']}，請確認 Token、權限或訊息額度，再按「重試 LINE」。" if current['last_status'] else public_error(exc)
+            hint = {400: '訊息或收件人格式錯誤', 401: 'Channel access token 無效或已過期',
+                    403: '權限不足', 429: '訊息額度或傳送速率限制'}.get(current['last_status'], '請確認 LINE 設定與服務狀態')
+            message = f"LINE HTTP {current['last_status']}：{hint}。處理後按「重試 LINE」。" if current['last_status'] else public_error(exc)
             if expired:
                 message = '有一則傳送結果不明且已超過 23 小時，已暫停 LINE。請保留紀錄並回報，避免重複傳送。'
             self.block_line(message)
@@ -334,7 +433,7 @@ class CloudBot(e.WSNewsBot):
             if result == 'retry':
                 await self.sleep(delay)
                 delay = min(delay*2, 60)
-            elif result == 'accepted':
+            elif result in ('accepted', 'skipped'):
                 delay = 5
                 await self.sleep(.5)
             else:
@@ -344,6 +443,10 @@ class CloudBot(e.WSNewsBot):
                     await asyncio.wait_for(self.changed_event.wait(), 5)
 
     def start(self):
+        self.log(f'金十 LINE 版本：{e.BOT_VERSION}｜{CLOUD_BUILD}')
+        self.log('LINE 通知已啟用。' if self.enabled else 'LINE 通知尚未啟用，請在管理頁按「啟用 LINE」。')
+        if self.line_error:
+            self.log(self.line_error)
         self.receive_task = asyncio.create_task(self.receive_forever())
         self.send_task = asyncio.create_task(self.send_forever())
 

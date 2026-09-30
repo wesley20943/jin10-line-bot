@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx2
 import engine as e
-from service import CloudBot
+from service import CLOUD_BUILD, CloudBot
 from app import create_app
 
 STATE = {'token':'fixture-token', 'user_id':'U'+'a'*32, 'bot_id':'fixture-bot',
@@ -168,6 +168,9 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         bot.handle_news({'id':item(2)['id'],'action':2,'important':1})
         await bot.send_one()
         self.assertIn('金十標記：重要',self.sent[0][1])
+        self.assertTrue(self.sent[0][1].startswith(item(2)['data']['content']+'\n\n時間：'))
+        for label in ('我的關注快訊','（台北）','主題：'):
+            self.assertNotIn(label,self.sent[0][1])
         bot.handle_news(item(3,now=self.now));bot.handle_news({'id':item(3)['id'],'action':3})
         bot.handle_news(item(4,now=self.now));bot.handle_news(item(4,'美国国债主题报告',now=self.now,action=2))
         self.assertEqual(await bot.send_one(),'idle')
@@ -236,12 +239,13 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
         socket=Socket([{'id':'bad'}],[packet(1000,{'action':1,'time':None}),
                       packet(1000,item(2,now=self.now,time=None)),packet(1201),
                       packet(1000,item(3,now=self.now))])
-        bot=self.bot(connector=connector(socket));bot.set_enabled(True);bot.start()
+        bot=self.bot(connector=connector(socket),sleep=quick_sleep);bot.set_enabled(True);bot.start()
         for _ in range(100):
             await asyncio.sleep(.002)
-            if self.sent:break
-        self.assertEqual(len(self.sent),1)
-        self.assertIn(item(3)['id'],self.sent[0][1])
+            if len(self.sent)==4:break
+        self.assertEqual(len(self.sent),4)
+        self.assertEqual(sum('【無法辨識資料】' in p[1] for p in self.sent),3)
+        self.assertTrue(any(item(3)['id'] in p[1] and p[1].startswith(item(3)['data']['content']) for p in self.sent))
         self.assertEqual(bot.stats['invalid_records'],3)
         self.assertIn(b'',socket.sent)
         self.assertFalse(bot.receive_task.done())
@@ -259,7 +263,177 @@ class CloudTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot.accept_news({'id':item(number)['id'],'action':2,'time':None}))
         self.assertEqual(dict(bot.pending()[0]),pending)
         self.assertNotEqual(bot.cache[item(1)['id']]['time'],None)
+        self.assertEqual(bot.counts().get('queued',0),2)
+        queued=bot.db.execute("SELECT row_json FROM outbox WHERE status='queued'").fetchall()
+        self.assertTrue(all(json.loads(r['row_json']).get('kind')=='unparsed' for r in queued))
+
+    async def test_diagnostic_survives_filters_timeout_restart_and_duplicate_snapshot(self):
+        async def fail(state,text,key):
+            await self.push(state,text,key)
+            raise httpx2.ReadTimeout('fixture')
+        bot=self.bot(push=fail);bot.set_enabled(True);bot.handle_snapshot([])
+        bad={'id':'broken','data':{'content':'主題：持倉報告'}}
+        bot.accept_news(bad,packet_code=1000)
+        before=dict(bot.db.execute("SELECT * FROM outbox WHERE status='queued'").fetchone())
+        bot.save_rules({'version':1,'include':[],'exclude':['主題','持倉報告'],'conflict':'exclude'})
+        self.assertEqual(dict(bot.get(before['event_key'])),before)
+        self.assertEqual(await bot.send_one(),'retry')
+        async def accepted_before(state,text,key):
+            await self.push(state,text,key)
+            return types.SimpleNamespace(status_code=409,headers={'x-line-accepted-request-id':'fixture'})
+        self.now+=timedelta(seconds=6)
+        bot=await self.reopen(bot,push=accepted_before)
+        bot.handle_snapshot([bad])
+        self.assertEqual(await bot.send_one(),'accepted')
+        self.assertEqual(self.sent[0],self.sent[1])
+        self.assertIn('【無法辨識資料】',self.sent[0][1])
+        bot=await self.reopen(bot)
+        bot.accept_news(dict(reversed(list(bad.items()))),packet_code=1001)
+        self.assertEqual(await bot.send_one(),'idle')
+        self.assertEqual(bot.counts()['accepted'],1)
+
+    async def test_diagnostic_respects_pause_and_no_replay_after_restart(self):
+        bot=self.bot()
+        bad={'id':'paused','data':{'content':'原始內容'}}
+        bot.accept_news(bad)
         self.assertEqual(bot.counts().get('queued',0),0)
+        self.assertEqual(await bot.send_one(),'idle')
+        bot=await self.reopen(bot)
+        bot.set_enabled(True)
+        bot.handle_snapshot([bad])
+        self.assertEqual(await bot.send_one(),'idle')
+        bot.accept_news({'id':'new-bad'})
+        self.assertEqual(bot.counts()['queued'],1)
+        bot.set_enabled(False)
+        bot.set_enabled(True)
+        self.assertEqual(await bot.send_one(),'idle')
+        self.assertFalse(self.sent)
+
+    async def test_diagnostic_redaction_in_durable_storage(self):
+        bot=self.bot();bot.set_enabled(True)
+        bad={'id':'bad','access_token':'private-source-token',
+             'data':{'content':STATE['token']+' '+STATE['user_id']}}
+        bot.accept_news(bad)
+        record=bot.db.execute('SELECT text,row_json FROM outbox').fetchone()
+        for value in record:
+            self.assertIn('[已遮蔽]',value)
+            for secret in ('private-source-token',STATE['token'],STATE['user_id']):
+                self.assertNotIn(secret,value)
+
+    async def test_candidate_status_explains_pause_without_backfill(self):
+        bot=self.bot();bot.handle_snapshot([])
+        bot.handle_news(item(1,now=self.now))
+        row=bot.recent_with_delivery()[0]
+        self.assertEqual(row['decision'],'候選')
+        self.assertIsNone(row['delivery'])
+        self.assertIn('收到時 LINE 通知暫停',row['delivery_note'])
+        self.assertTrue(any('LINE 未排入' in log['text'] for log in bot.logs))
+        bot.set_enabled(True)
+        self.assertEqual(await bot.send_one(),'idle')
+        bot.handle_news(item(2,now=self.now))
+        self.assertEqual(bot.recent_with_delivery()[0]['delivery']['status'],'queued')
+        self.assertEqual(await bot.send_one(),'accepted')
+        row=bot.recent_with_delivery()[0]
+        self.assertEqual(row['delivery']['http_status'],200)
+        self.assertIn('API 已接受',row['delivery']['label'])
+        self.assertEqual(len(self.sent),1)
+
+    async def test_explicit_line_test_survives_rules_and_restart_without_duplicate(self):
+        bot=self.bot()
+        with self.assertRaisesRegex(e.BotError,'啟用 LINE'):
+            bot.queue_line_test()
+        self.assertEqual(bot.counts().get('queued',0),0)
+        bot.set_enabled(True)
+        self.assertEqual(await bot.send_one(),'idle')
+        self.assertFalse(bot.queue_line_test()['reused'])
+        original=dict(bot.latest_test())
+        self.assertTrue(bot.queue_line_test()['reused'])
+        bot.save_rules({'version':1,'include':[],'exclude':['LINE','測試'],'conflict':'exclude'})
+        bot=await self.reopen(bot)
+        self.assertTrue(bot.queue_line_test()['reused'])
+        self.assertEqual(dict(bot.latest_test()),original)
+        self.assertEqual(len(self.sent),0)
+        self.assertEqual(await bot.send_one(),'accepted')
+        self.assertEqual(len(self.sent),1)
+        with self.assertRaisesRegex(e.BotError,'60 秒'):
+            bot.queue_line_test()
+        self.assertEqual(bot.delivery_status()['test']['http_status'],200)
+        self.assertEqual(await bot.send_one(),'idle')
+
+    async def test_line_test_timeout_reuses_original_body_and_key_after_restart(self):
+        async def fail(state,text,key):
+            await self.push(state,text,key)
+            raise httpx2.ReadTimeout('fixture')
+        bot=self.bot(push=fail);bot.set_enabled(True);bot.queue_line_test()
+        self.assertEqual(await bot.send_one(),'retry')
+        self.assertEqual(bot.delivery_status()['test']['status'],'pending')
+        async def already_accepted(state,text,key):
+            await self.push(state,text,key)
+            return types.SimpleNamespace(status_code=409,headers={'x-line-accepted-request-id':'fixture'})
+        self.now+=timedelta(seconds=65)
+        bot=await self.reopen(bot,push=already_accepted)
+        self.assertTrue(bot.queue_line_test()['reused'])
+        self.assertEqual(await bot.send_one(),'accepted')
+        self.assertEqual(self.sent[0],self.sent[1])
+        self.assertEqual(bot.delivery_status()['test']['http_status'],409)
+        self.assertEqual(bot.counts()['accepted'],1)
+
+    async def test_line_test_reports_429_and_does_not_bypass_block(self):
+        async def limited(state,text,key):
+            await self.push(state,text,key)
+            return types.SimpleNamespace(status_code=429,headers={})
+        bot=self.bot(push=limited);bot.set_enabled(True);bot.queue_line_test()
+        self.assertEqual(await bot.send_one(),'blocked')
+        original=dict(bot.latest_test())
+        bot=await self.reopen(bot)
+        status=bot.delivery_status()['test']
+        self.assertEqual(status['http_status'],429)
+        self.assertIn('傳送停止',status['label'])
+        with self.assertRaisesRegex(e.BotError,'HTTP 429'):
+            bot.queue_line_test()
+        self.assertEqual(dict(bot.latest_test()),original)
+        self.assertEqual(len(self.sent),1)
+
+    async def test_expired_or_stopped_delivery_is_not_counted_as_accepted(self):
+        bot=self.bot();bot.set_enabled(True);bot.queue_line_test()
+        self.now+=timedelta(minutes=16)
+        self.assertEqual(await bot.send_one(),'skipped')
+        self.assertEqual(bot.stats['accepted'],0)
+        self.assertFalse(bot.queue_line_test()['reused'])
+        bot.stop_requested=True
+        self.assertEqual(await bot.send_one(),'idle')
+        self.assertEqual(bot.stats['accepted'],0)
+        self.assertEqual(len(self.sent),0)
+
+    async def test_test_button_requires_auth_csrf_and_only_queues_on_post(self):
+        bot=self.bot();runtime=RuntimeFixture(bot)
+        app=create_app(password=PASSWORD,data_dir=Path(self.tmp.name),runtime=runtime)
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app),base_url='https://fixture.test') as client:
+                command={'action':'test-line'}
+                self.assertEqual((await client.post('/api/control',json=command)).status_code,401)
+                await client.post('/api/login',json={'password':PASSWORD})
+                status=(await client.get('/api/status')).json()
+                self.assertEqual(status['version'],'2.4-websocket')
+                self.assertEqual(status['build'],CLOUD_BUILD)
+                self.assertIsNone(status['delivery']['test'])
+                self.assertEqual((await client.get('/api/control')).status_code,405)
+                self.assertEqual((await client.post('/api/control',json=command)).status_code,403)
+                headers={'X-CSRF-Token':status['csrf']}
+                self.assertEqual((await client.post('/api/control',json=command,headers=headers)).status_code,400)
+                bot.set_enabled(True)
+                response=await client.post('/api/control',json=command,headers=headers)
+                self.assertEqual(response.status_code,200)
+                self.assertEqual(response.json()['delivery']['status'],'queued')
+                self.assertEqual(len(self.sent),0)
+                self.assertEqual((await client.post('/api/control',json=command,headers={**headers,'Sec-Fetch-Site':'cross-site'})).status_code,403)
+                self.assertTrue((await client.post('/api/control',json=command,headers=headers)).json()['reused'])
+                await bot.send_one()
+                status=(await client.get('/api/status')).json()
+                self.assertEqual(status['delivery']['test']['http_status'],200)
+                self.assertNotIn(STATE['token'],json.dumps(status))
+                self.assertNotIn(STATE['user_id'],json.dumps(status))
+                self.assertEqual(len(self.sent),1)
 
     async def test_web_auth_csrf_live_save_trial_backup_and_body_limit(self):
         bot=self.bot();runtime=RuntimeFixture(bot)

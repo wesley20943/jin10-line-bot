@@ -21,7 +21,7 @@ from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
 import engine as e
-from service import CloudBot, LineClient, public_error
+from service import CLOUD_BUILD, CloudBot, LineClient, public_error
 
 ROOT = Path(__file__).parent
 
@@ -111,6 +111,7 @@ def create_app(*, password=None, data_dir=None, runtime=None, secure_cookie=True
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
+        logging.getLogger('jin10').info('啟動金十 LINE %s｜%s', e.BOT_VERSION, CLOUD_BUILD)
         data_dir.mkdir(parents=True, exist_ok=True)
         # Railway deployments must have a real volume attached for persistence.
         if real_runtime and os.environ.get('RAILWAY_ENVIRONMENT_ID'):
@@ -197,11 +198,13 @@ def create_app(*, password=None, data_dir=None, runtime=None, secure_cookie=True
     async def status(request):
         authorized(request)
         bot = runtime.bot
-        result = {'ready': bot is not None, 'error': runtime.error, 'csrf': request.session['csrf']}
+        result = {'ready': bot is not None, 'error': runtime.error, 'csrf': request.session['csrf'],
+                  'version': e.BOT_VERSION, 'build': CLOUD_BUILD}
         if bot:
             result.update(enabled=bot.enabled, rules=bot.rules, ws_status=bot.ws_status,
                 ws_error=bot.ws_error, line_error=bot.line_error, last_event=bot.last_event,
-                counts=bot.counts(), stats=dict(bot.stats), recent=list(reversed(bot.recent)),
+                counts=bot.counts(), stats=dict(bot.stats), recent=bot.recent_with_delivery(),
+                delivery=bot.delivery_status(),
                 logs=list(reversed(bot.logs))[:15], recipient=bot.state.get('recipient_name',''),
                 bot_name=bot.state.get('bot_name', ''))
         return JSONResponse(result)
@@ -229,6 +232,8 @@ def create_app(*, password=None, data_dir=None, runtime=None, secure_cookie=True
             bot.resume_line()
         elif action == 'reconnect':
             bot.reconnect_event.set()
+        elif action == 'test-line':
+            return JSONResponse({'ok': True, **bot.queue_line_test()})
         else:
             raise HTTPException(400, '不支援的操作。')
         return JSONResponse({'ok': True})

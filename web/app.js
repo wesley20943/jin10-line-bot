@@ -20,6 +20,11 @@ function draft() {return {version:1,exclude:$('exclude').value.split(/\r?\n/).ma
 function fill(rules) {$('exclude').value=rules.exclude.join('\n');$('include').value=rules.include.join('\n');$('conflict').value=rules.conflict;}
 function edited() {dirty=true;$('save-status').textContent='有尚未儲存的修改';}
 function node(tag, text, cls) {const n=document.createElement(tag);n.textContent=text;if(cls)n.className=cls;return n;}
+function deliveryText(result) {
+  if(!result)return '尚無紀錄';
+  const http=result.http_status===null?'':`（HTTP ${result.http_status}）`;
+  return result.label+http+' · '+clock(result.time);
+}
 function feed(rows) {
   const target=$('feed');target.replaceChildren();
   if(!rows.length){target.append(node('p','等待新的快訊；首次啟動不補發歷史消息。','empty'));return;}
@@ -28,6 +33,7 @@ function feed(rows) {
     meta.append(node('span',clock(row.time)),node('span',row.decision,'badge'));
     if(row.important===true)meta.append(node('span','● 金十重要','badge important'));
     article.append(meta,node('p',row.text),node('p',row.reason,'reason'));
+    article.append(node('p','LINE：'+(row.delivery?deliveryText(row.delivery):row.delivery_note),'delivery-note'));
     if(/^https:\/\/flash\.jin10\.com\/detail\/\d+$/.test(row.url)){const link=node('a','查看金十原文 ↗');link.href=row.url;link.target='_blank';link.rel='noopener noreferrer';article.append(link);}
     target.append(article);
   }
@@ -36,7 +42,8 @@ async function refresh() {
   try {
     const data=await api('/api/status');current=data;csrf=data.csrf;
     show('login-panel',false);show('desk',true);show('logout',true);
-    $('save').disabled=!data.ready;$('notify').disabled=!data.ready;
+    $('version').textContent='執行版本 '+data.version+' · '+data.build;
+    $('save').disabled=!data.ready;$('notify').disabled=!data.ready;$('test-line').disabled=!data.ready;
     if(!data.ready){$('connection-error').textContent=data.error||'正在確認 LINE 設定…';show('connection-error',true);return;}
     if(!loaded){fill(data.rules);loaded=true;dirty=false;$('save-status').textContent='已載入儲存的設定';}
     $('ws-status').textContent=data.ws_status;$('last-event').textContent='最近接收 '+clock(data.last_event);
@@ -44,7 +51,10 @@ async function refresh() {
     $('recipient').textContent=data.bot_name+' → '+data.recipient;
     $('today').replaceChildren(document.createTextNode(String(data.counts.today||0)+' '),node('em','則'));
     $('notify').textContent=data.enabled?'暫停 LINE':'啟用 LINE';
-    $('notify-hint').textContent=data.enabled?'新快訊符合篩選條件時，會自動傳送到你的 LINE。':'啟用後傳送新快訊；暫停期間的消息不補發。';
+    $('notify-hint').textContent=data.enabled?'符合條件的新快訊及「無法辨識資料」會傳到 LINE。':'啟用後傳送新快訊與無法辨識資料；暫停期間不補發。';
+    $('queue-status').textContent=`待傳 ${data.counts.queued||0} 則 · 傳送中／結果待確認 ${data.counts.pending||0} 則`;
+    $('latest-delivery').textContent='最近傳送：'+deliveryText(data.delivery.latest);
+    $('test-result').textContent='測試結果：'+(data.delivery.test?deliveryText(data.delivery.test):'尚未測試');
     const errors=[data.ws_error,data.line_error].filter(Boolean);$('connection-error').textContent=errors.join('\n');show('connection-error',errors.length>0);
     show('reconnect',!!data.ws_error);show('retry-line',!!data.line_error);
     feed(data.recent);
@@ -64,6 +74,11 @@ async function control(data){show('connection-error',true);await api('/api/contr
 $('notify').addEventListener('click',()=>action($('notify'),()=>control({action:'notify',enabled:!current.enabled}),'connection-error'));
 $('retry-line').addEventListener('click',()=>action($('retry-line'),()=>control({action:'retry-line'}),'connection-error'));
 $('reconnect').addEventListener('click',()=>action($('reconnect'),()=>control({action:'reconnect'}),'connection-error'));
+$('test-line').addEventListener('click',()=>action($('test-line'),async()=>{
+  $('test-action-error').textContent='';
+  await api('/api/control',{action:'test-line'});
+  await refresh();
+},'test-action-error'));
 $('download').addEventListener('click',()=>{if(dirty){$('import-status').textContent='請先儲存修改，再下載備份。';return;}window.location.assign('/api/backup');});
 $('import').addEventListener('change',async event=>{
   const file=event.target.files[0];if(!file)return;
